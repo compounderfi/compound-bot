@@ -205,12 +205,11 @@ async function updatePositions() {
   const tempCalls: Call[] = []
   for(const position of positions) {
     const call = new Call(position.tokenId, 200000, 200000, position.token0Decimals, position.token1Decimals);
-    const isWorking = await call.getFees(); //checks to see if the position can be compounded
-    if (isWorking) {
-      await call.getCallableGas();
+    if (await call.getFees() && await call.getCallableGas()) {
+      tempCalls.push(call);
+      console.log(tempCalls);
+      await new Promise(r => setTimeout(r, 3000)); //wait 3 seconds
     }
-
-    tempCalls.push(call)
 
   }
   return tempCalls;
@@ -221,9 +220,12 @@ async function main() {
         calls = await updatePositions();
     }, 10 * 60 * 1000 //refresh positions every 10 minutes
     )
+
+    /*
     setInterval(() => {
       console.log(calls)
     })
+    */
     await updatePositions();
     //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
 
