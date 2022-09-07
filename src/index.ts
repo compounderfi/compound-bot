@@ -1,5 +1,5 @@
 import * as dotenv from 'dotenv'
-import { ethers, Contract } from "ethers";
+import { ethers, Contract, BigNumber } from "ethers";
 import abi from "./abis/compounder.json";
 import {tokenToAuto} from '@thanpolas/crypto-utils';
 import { Alchemy, Network } from "alchemy-sdk";
@@ -78,18 +78,30 @@ async function getPrices(uniqueTokens) {
 }
 
 class Call {
-  tokenID: Number;
-  price0: Number;
-  price1:Number;
-  token0Decimals: Number;
-  token1Decimals:Number;
+  tokenID: number;
+  price0: number;
+  price1: number;
+  token0Decimals: number;
+  token1Decimals:number;
 
-  fees0: Number;
-  fees1: Number;
-  fees0Swap: Number;
-  fees1Swap: Number;
-  //token - true: token0, false: token1
-  constructor(tokenID: Number, price0: Number, price1:Number, token0Decimals: Number, token1Decimals:Number) {
+  token0callerfees: String;
+  token1callerfees: String;
+
+  token: Boolean; //token - true: token0, false: token1
+  callerFeesNoSwap: number;
+  callerFeesSwap: number;
+  maxGwei: number;
+
+  gasLimitNoSwap: BigNumber;
+  gasLimitSwap: BigNumber;
+
+  gasPriceWei: BigNumber;
+
+  doSwap: Boolean;
+
+  gasThreshold: number;
+
+  constructor(tokenID: number, price0: number, price1:number, token0Decimals: number, token1Decimals:number) {
     this.tokenID = tokenID;
     this.price0 = price0;
     this.price1 = price1;
@@ -99,55 +111,88 @@ class Call {
   }
 
   async getFees() {
-    const token0callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"].toString();
+    try {
+      this.token0callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"].toString();
+    } catch {
+      return false;
+    }
+    const fees0InDecimal = parseFloat(tokenToAuto(this.token0callerfees, this.token0Decimals, {decimalPlaces: this.token0Decimals}));
+    const fee0InEth = fees0InDecimal * this.price0;
 
-    const fees0InDecimal = parseFloat(tokenToAuto(token0callerfees, this.token0Decimals, {decimalPlaces: this.token0Decimals}));
-    const token0PriceEth = 0.034234325534//prices[position.token0Address];
-    const fee0InEth = fees0InDecimal * token0PriceEth;
+    this.token1callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"].toString();
 
-    const token1callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"].toString();
+    const fees1InDecimal = parseFloat(tokenToAuto(this.token1callerfees, this.token1Decimals, {decimalPlaces: this.token1Decimals}));
+    const fee1InEth = fees1InDecimal * this.price1;
 
-    const fees1InDecimal = parseFloat(tokenToAuto(token1callerfees, this.token1Decimals, {decimalPlaces: this.token1Decimals}));
-    const token1PriceEth = 0.2924235435 // prices[position.token1Address];
-    const fee1InEth = fees1InDecimal * token1PriceEth;
+    this.token = fee0InEth > fee1InEth;
+    if (fee0InEth > fee1InEth) {
+      this.callerFeesNoSwap = fee0InEth;
+      this.callerFeesSwap = fee0InEth * 1.25;
+      this.token = true;
+    } else {
+      this.callerFeesNoSwap = fee1InEth;
+      this.callerFeesSwap = fee1InEth * 1.25;
+      this.token = false;
+    }
 
-    this.fees0 = fee0InEth;
-    this.fees1 = fee1InEth;
-    this.fees0Swap = (fee0InEth * 5)/4
-    this.fees1Swap = (fee1InEth * 5)/4
-    
+    this.gasPriceWei = await provider.getGasPrice();
+    return true;
+  }
+
+  async getCallableGas() {
+    this.gasLimitNoSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, false])).add(15000);
+    const estimatedCostNoSwap = parseFloat(ethers.utils.formatEther(this.gasLimitNoSwap.mul(this.gasPriceWei)));
+
+    this.gasLimitSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, true])).add(15000);
+    const estimatedCostSwap = parseFloat(ethers.utils.formatEther(this.gasLimitSwap.mul(this.gasPriceWei)));
+
+    const profitNoSwap = this.callerFeesNoSwap - estimatedCostNoSwap;
+    const profitSwap = this.callerFeesSwap - estimatedCostSwap;
+
+    this.doSwap = profitSwap > profitNoSwap;
+
+    if (this.doSwap) {
+      const threshold = this.callerFeesSwap * 1.15
+      this.gasThreshold = (threshold / this.gasLimitSwap.toNumber()) * 10 ** 18;
+    } else {
+      const threshold = this.callerFeesNoSwap * 1.15
+      this.gasThreshold = (threshold / this.gasLimitNoSwap.toNumber()) * 10 ** 18;
+    }
+  }
+
+  async ensureFees() {
+    const currentFee0 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"];
+    const pastFee0 = BigNumber.from(this.token0callerfees);
+
+    const currentFee1 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"];
+    const pastFee1 = BigNumber.from(this.token1callerfees);
+    console.log(currentFee0.gte(pastFee0), currentFee1.gte(pastFee1))
+    return currentFee0.gte(pastFee0) && currentFee1.gte(pastFee1);
+  }
+
+  async sendTXN() {
+    const shouldCompound = await this.ensureFees();
+    if (!shouldCompound) return false
+
+    await contract.connect(signer).autoCompound([this.tokenID, this.token, this.doSwap], {gasLimit: this.doSwap ? this.gasLimitSwap : this.gasLimitNoSwap})
   }
 }
+
 async function main() {
     
     const [positions, uniqueTokens] = await getTokens();
     const prices = await getPrices(uniqueTokens);
 
     
-        const position = positions[0]
-        /*
-        const token0callerfees = (await contract.connect(signer).callStatic.autoCompound([position.tokenId, true, false]))["fee0"].toString();
+    const position = positions[1]
+    const poszero = new Call(position.tokenId, 200000, 200000, position.token0Decimals, position.token1Decimals);
+    //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
+    const isWorking = await poszero.getFees();
+    if (isWorking) {
+      await poszero.getCallableGas();
+      await poszero.sendTXN();
+    }
 
-        const fees0InDecimal = parseFloat(tokenToAuto(token0callerfees, position.token0Decimals, {decimalPlaces: position.token0Decimals}));
-        const token0PriceEth = 0.034234325534//prices[position.token0Address];
-        const fee0InEth = fees0InDecimal * token0PriceEth;
-
-        const token1callerfees = (await contract.connect(signer).callStatic.autoCompound([position.tokenId, false, false]))["fee1"].toString();
-
-        const fees1InDecimal = parseFloat(tokenToAuto(token1callerfees, position.token1Decimals, {decimalPlaces: position.token1Decimals}));
-        const token1PriceEth = 0.2924235435 // prices[position.token1Address];
-        const fee1InEth = fees1InDecimal * token1PriceEth;
-
-        const costToRecieve0 = await contract.connect(signer).estimateGas.autoCompound([position.tokenId, true, false]);
-        const costToRecieve1 = await contract.connect(signer).estimateGas.autoCompound([position.tokenId, false, false]);
-        const x = await contract.connect(signer).estimateGas.autoCompound([position.tokenId, true, true]);
-        const y = await contract.connect(signer).estimateGas.autoCompound([position.tokenId, false, true]);
-
-        console.log(costToRecieve0.toNumber(), costToRecieve1.toNumber(), x.toNumber(), y.toNumber())
-        console.log(fee0InEth, fee1InEth)
-        */
-
-   
 
     /*
     const settings = {
