@@ -113,13 +113,13 @@ class Call {
   async getFees() {
     try {
       this.token0callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"].toString();
-    } catch {
+      this.token1callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"].toString();
+    } catch(e) {
+      console.log(e)
       return false;
     }
     const fees0InDecimal = parseFloat(tokenToAuto(this.token0callerfees, this.token0Decimals, {decimalPlaces: this.token0Decimals}));
     const fee0InEth = fees0InDecimal * this.price0;
-
-    this.token1callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"].toString();
 
     const fees1InDecimal = parseFloat(tokenToAuto(this.token1callerfees, this.token1Decimals, {decimalPlaces: this.token1Decimals}));
     const fee1InEth = fees1InDecimal * this.price1;
@@ -140,10 +140,14 @@ class Call {
   }
 
   async getCallableGas() {
-    this.gasLimitNoSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, false])).add(15000);
+    try {
+      this.gasLimitNoSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, false])).add(15000);
+      this.gasLimitSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, true])).add(15000);
+    } catch(e) {
+      console.log(e);
+      return false;
+    }
     const estimatedCostNoSwap = parseFloat(ethers.utils.formatEther(this.gasLimitNoSwap.mul(this.gasPriceWei)));
-
-    this.gasLimitSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, true])).add(15000);
     const estimatedCostSwap = parseFloat(ethers.utils.formatEther(this.gasLimitSwap.mul(this.gasPriceWei)));
 
     const profitNoSwap = this.callerFeesNoSwap - estimatedCostNoSwap;
@@ -158,13 +162,23 @@ class Call {
       const threshold = this.callerFeesNoSwap * 1.15
       this.gasThreshold = (threshold / this.gasLimitNoSwap.toNumber()) * 10 ** 18;
     }
+
+    return true;
   }
 
   async ensureFees() {
-    const currentFee0 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"];
+    let currentFee0: BigNumber;
+    let currentFee1: BigNumber;
+    try {
+      currentFee0 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"];
+      currentFee1 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"];
+    } catch(e) {
+      console.log(e);
+      return false;
+    }
+
     const pastFee0 = BigNumber.from(this.token0callerfees);
 
-    const currentFee1 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"];
     const pastFee1 = BigNumber.from(this.token1callerfees);
     console.log(currentFee0.gte(pastFee0), currentFee1.gte(pastFee1))
     return currentFee0.gte(pastFee0) && currentFee1.gte(pastFee1);
@@ -174,25 +188,44 @@ class Call {
     const shouldCompound = await this.ensureFees();
     if (!shouldCompound) return false
 
-    await contract.connect(signer).autoCompound([this.tokenID, this.token, this.doSwap], {gasLimit: this.doSwap ? this.gasLimitSwap : this.gasLimitNoSwap})
+    try {
+      await contract.connect(signer).autoCompound([this.tokenID, this.token, this.doSwap], {gasLimit: this.doSwap ? this.gasLimitSwap : this.gasLimitNoSwap})
+    } catch(e) {
+      console.log(e);
+      return false;
+    }
+    return true;
   }
 }
 
-async function main() {
-    
-    const [positions, uniqueTokens] = await getTokens();
-    const prices = await getPrices(uniqueTokens);
-
-    
-    const position = positions[1]
-    const poszero = new Call(position.tokenId, 200000, 200000, position.token0Decimals, position.token1Decimals);
-    //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
-    const isWorking = await poszero.getFees();
+async function updatePositions() {
+  const [positions, uniqueTokens] = await getTokens();
+  const prices = await getPrices(uniqueTokens);
+  
+  const tempCalls: Call[] = []
+  for(const position of positions) {
+    const call = new Call(position.tokenId, 200000, 200000, position.token0Decimals, position.token1Decimals);
+    const isWorking = await call.getFees(); //checks to see if the position can be compounded
     if (isWorking) {
-      await poszero.getCallableGas();
-      await poszero.sendTXN();
+      await call.getCallableGas();
     }
 
+    tempCalls.push(call)
+
+  }
+  return tempCalls;
+}
+async function main() {
+    let calls: Call[] = []
+    setInterval(async () => {
+        calls = await updatePositions();
+    }, 10 * 60 * 1000 //refresh positions every 10 minutes
+    )
+    setInterval(() => {
+      console.log(calls)
+    })
+    await updatePositions();
+    //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
 
     /*
     const settings = {
