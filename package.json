@@ -18,10 +18,13 @@
   },
   "homepage": "https://github.com/compounderfi/compound-bot#readme",
   "devDependencies": {
+    "@types/node": "^18.14.2",
     "typescript": "^4.8.2"
   },
   "dependencies": {
+    "@eth-optimism/sdk": "^2.0.1",
     "@thanpolas/crypto-utils": "^0.4.1",
+    "@types/es6-promise": "^3.3.0",
     "alchemy-sdk": "^2.0.3",
     "axios": "^0.27.2",
     "dotenv": "^16.0.2",

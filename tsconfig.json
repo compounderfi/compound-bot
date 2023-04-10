@@ -1,16 +1,25 @@
 {
     "compilerOptions": {
-      "module": "commonjs",
-      "esModuleInterop": true,
+      "module": "CommonJS",
       "target": "es6",
       "moduleResolution": "node",
       "sourceMap": true,
       "outDir": "dist",
       "resolveJsonModule": true,
-      "noImplicitUseStrict": true
+      "esModuleInterop": true,
+      "allowSyntheticDefaultImports": true,
+      "lib": [
+        "es2018",
+        "dom",
+        "es2015.promise"
+      ],
     },
-    "lib": ["es2015"],
     "include": [
-      "./src/"
-    ]
+      "./src/*"
+    ],
+    "exclude": [
+      "node_modules",
+      "dist",
+      "tests"
+  ]
 }

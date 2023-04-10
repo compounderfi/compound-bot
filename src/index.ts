@@ -1,19 +1,23 @@
-import * as dotenv from 'dotenv'
+import * as dotenv from "dotenv";
 import { ethers, Contract, BigNumber } from "ethers";
-import abi from "./abis/compounder.json";
+import {COMPOUNDER_CONTRACT_ADDRESS, NFPM_ADDRESS, COMPOUNDER_ABI} from "./test"
 import {tokenToAuto} from '@thanpolas/crypto-utils';
 import { Alchemy, Network } from "alchemy-sdk";
+import axios from "axios";
+const optimismSDK = require("@eth-optimism/sdk")
 
-const axios = require('axios').default;
+dotenv.config();
 
-dotenv.config()
+const l2RpcProvider = optimismSDK.asL2Provider(
+  new ethers.providers.JsonRpcProvider(process.env.RPC_OPTIMISM)
+)
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL);
-const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
-const contract = new ethers.Contract("0x979d7E9CdE9a270276495f9054923cFdA8Db0E09", abi, provider)
+const signer = new ethers.Wallet(process.env.PRIVATE_KEY, l2RpcProvider)
+const contract = new ethers.Contract(COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, l2RpcProvider)
+const standardDecimals = ethers.BigNumber.from(10).pow(18);
 
 async function getTokens() {
-    const graphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/test1";
+    const graphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-optimism";
     const resp = await axios.post(graphURL, {
       query: `
       {
@@ -56,7 +60,7 @@ async function getTokens() {
 
 
 async function getPrices(uniqueTokens) {
-    const graphURL = "https://api.thegraph.com/subgraphs/name/compositelabs/uniswap-v3-goerli";
+    const graphURL = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-optimism";
     const resp = await axios.post(graphURL, {
         query: `
         {
@@ -84,21 +88,21 @@ class Call {
   token0Decimals: number;
   token1Decimals:number;
 
+  fee0InEth: number;
+  fee1InEth: number;
+
   token0callerfees: String;
   token1callerfees: String;
 
-  token: Boolean; //token - true: token0, false: token1
-  callerFeesNoSwap: number;
-  callerFeesSwap: number;
   maxGwei: number;
 
-  gasLimitNoSwap: BigNumber;
-  gasLimitSwap: BigNumber;
+  gasEstimateToken0AsFee: number; //gas estimate in total - gas limit * gas price
+  gasEstimateToken1AsFee: number;
 
-  gasPriceWei: BigNumber;
+  gasPriceWei: number;
 
-  doSwap: Boolean;
-
+  shouldTakeToken0: Boolean;
+  shouldCompound: Boolean;
   gasThreshold: number;
 
   constructor(tokenID: number, price0: number, price1:number, token0Decimals: number, token1Decimals:number) {
@@ -112,66 +116,78 @@ class Call {
 
   async getFees() {
     try {
-      this.token0callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"].toString();
-      this.token1callerfees = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"].toString();
+      this.token0callerfees = (await contract.connect(signer).callStatic.compound(this.tokenID, true))["fee0"].toString();
+      this.token1callerfees = (await contract.connect(signer).callStatic.compound(this.tokenID, false))["fee1"].toString();
     } catch(e) {
       console.log(e)
       return false;
     }
     const fees0InDecimal = parseFloat(tokenToAuto(this.token0callerfees, this.token0Decimals, {decimalPlaces: this.token0Decimals}));
-    const fee0InEth = fees0InDecimal * this.price0;
+    this.fee0InEth = fees0InDecimal * this.price0;
 
     const fees1InDecimal = parseFloat(tokenToAuto(this.token1callerfees, this.token1Decimals, {decimalPlaces: this.token1Decimals}));
-    const fee1InEth = fees1InDecimal * this.price1;
-
-    this.token = fee0InEth > fee1InEth;
-    if (fee0InEth > fee1InEth) {
-      this.callerFeesNoSwap = fee0InEth;
-      this.callerFeesSwap = fee0InEth * 1.25;
-      this.token = true;
-    } else {
-      this.callerFeesNoSwap = fee1InEth;
-      this.callerFeesSwap = fee1InEth * 1.25;
-      this.token = false;
-    }
-
-    this.gasPriceWei = await provider.getGasPrice();
+    this.fee1InEth = fees1InDecimal * this.price1;
+    
+    /*
+    this.gasPriceWei = (await l2RpcProvider.getGasPrice()).toNumber();
+    */
     return true;
   }
 
+  async estimateGasOptimism(tokenID: number, token0AsFee: boolean) {
+    const txn = await contract.populateTransaction.compound(tokenID, token0AsFee)
+    
+    txn.gasPrice = ethers.BigNumber.from( 0 ); //optimism only: doesn't work when gasPrice is estimated for some reason
+
+    const populatedTxn = await signer.populateTransaction(txn)
+    const gasEstimate = await l2RpcProvider.estimateTotalGasCost(populatedTxn)
+
+    return parseFloat(tokenToAuto(gasEstimate.toString(), 18, {decimalPlaces: 18}));
+  }
   async getCallableGas() {
     try {
-      this.gasLimitNoSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, false])).add(15000);
-      this.gasLimitSwap = (await contract.connect(signer).estimateGas.autoCompound([this.tokenID, this.token, true])).add(15000);
+      this.gasEstimateToken0AsFee = await this.estimateGasOptimism(this.tokenID, true);
+      this.gasEstimateToken1AsFee = await this.estimateGasOptimism(this.tokenID, false);
     } catch(e) {
       console.log(e);
       return false;
     }
-    const estimatedCostNoSwap = parseFloat(ethers.utils.formatEther(this.gasLimitNoSwap.mul(this.gasPriceWei)));
-    const estimatedCostSwap = parseFloat(ethers.utils.formatEther(this.gasLimitSwap.mul(this.gasPriceWei)));
 
-    const profitNoSwap = this.callerFeesNoSwap - estimatedCostNoSwap;
-    const profitSwap = this.callerFeesSwap - estimatedCostSwap;
+    this.gasEstimateToken0AsFee *= 1.25; //account for compounding risk, as well as changes in gas
+    this.gasEstimateToken1AsFee *= 1.25;
+    /*
+    const estimatedCostToken0AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken0AsFee * this.gasPriceWei));
+    const estimatedCostToken1AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken1AsFee * this.gasPriceWei));
+    */
+    const profitToken0 = this.fee0InEth - this.gasEstimateToken0AsFee;
+    const profitToken1 = this.fee1InEth - this.gasEstimateToken1AsFee;
+    
+    this.shouldTakeToken0 = profitToken0 > profitToken1;
 
-    this.doSwap = profitSwap > profitNoSwap;
-
-    if (this.doSwap) {
-      const threshold = this.callerFeesSwap * 1.15
-      this.gasThreshold = (threshold / this.gasLimitSwap.toNumber()) * 10 ** 18;
+    if (profitToken0 > 0 || profitToken1 > 0) {
+      this.shouldCompound = true;
     } else {
-      const threshold = this.callerFeesNoSwap * 1.15
-      this.gasThreshold = (threshold / this.gasLimitNoSwap.toNumber()) * 10 ** 18;
+      this.shouldCompound = false;
     }
+    
+    /*
+    if (this.shouldTakeToken0) {
+      const gasLimitEstimate0 = this.gasLimitToken0AsFee * 1.1
+      this.gasThreshold = (this.fee0InEth / gasLimitEstimate0) * 10 ** 18;
+    } else {
+      const gasLimitEstimate1 = this.fee1InEth * 1.1
+      this.gasThreshold = (this.fee1InEth / gasLimitEstimate1) * 10 ** 18;
+    }*/
 
     return true;
   }
-
+/*
   async ensureFees() {
     let currentFee0: BigNumber;
     let currentFee1: BigNumber;
     try {
-      currentFee0 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, true, false]))["fee0"];
-      currentFee1 = (await contract.connect(signer).callStatic.autoCompound([this.tokenID, false, false]))["fee1"];
+      currentFee0 = (await contract.connect(signer).callStatic.compound(this.tokenID, true))["fee0"];
+      currentFee1 = (await contract.connect(signer).callStatic.compound(this.tokenID, false))["fee1"];
     } catch(e) {
       console.log(e);
       return false;
@@ -183,13 +199,11 @@ class Call {
     console.log(currentFee0.gte(pastFee0), currentFee1.gte(pastFee1))
     return currentFee0.gte(pastFee0) && currentFee1.gte(pastFee1);
   }
-
+*/
   async sendTXN() {
-    const shouldCompound = await this.ensureFees();
-    if (!shouldCompound) return false
-
     try {
-      await contract.connect(signer).autoCompound([this.tokenID, this.token, this.doSwap], {gasLimit: this.doSwap ? this.gasLimitSwap : this.gasLimitNoSwap})
+      console.log("sending txn for tokenID: " + this.tokenID)
+      //await contract.connect(signer).compound(this.tokenID, this.token, )
     } catch(e) {
       console.log(e);
       return false;
@@ -200,55 +214,68 @@ class Call {
 
 async function updatePositions() {
   const [positions, uniqueTokens] = await getTokens();
+
   const prices = await getPrices(uniqueTokens);
-  
-  const tempCalls: Call[] = []
+
+  const tempCalls: Call[] = [];
   for(const position of positions) {
-    const call = new Call(position.tokenId, 200000, 200000, position.token0Decimals, position.token1Decimals);
+    const token0Price = prices[position.token0Address];
+    const token1Price = prices[position.token1Address];
+    const call = new Call(position.tokenId, token0Price, token1Price, position.token0Decimals, position.token1Decimals);
     if (await call.getFees() && await call.getCallableGas()) {
-      tempCalls.push(call);
-      console.log(tempCalls);
+      tempCalls.push(call)
+
+      if (call.shouldCompound) {
+        await call.sendTXN();
+        call.shouldCompound = false
+      }
+      
+      console.log(call)
       await new Promise(r => setTimeout(r, 3000)); //wait 3 seconds
     }
 
   }
   return tempCalls;
 }
+
 async function main() {
+
     let calls: Call[] = []
     setInterval(async () => {
         calls = await updatePositions();
     }, 10 * 60 * 1000 //refresh positions every 10 minutes
     )
 
-    /*
+    
     setInterval(() => {
+      if (calls.length > 0)
       console.log(calls)
     })
-    */
+    
     await updatePositions();
     //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
 
     /*
     const settings = {
         apiKey: process.env.ALCHEMY_API_KEY, // Replace with your Alchemy API Key.
-        network: Network.ETH_MAINNET, // Replace with your network.
+        network: Network.OPT_MAINNET, // Replace with your network.
     };
 
     const alchemy = new Alchemy(settings);
 
     // Subscription for new blocks on Eth Mainnet.
     alchemy.ws.on("block", async (blockNumber) => {
-      console.log("The latest block number is", blockNumber);
+      //console.log("The latest block number is", blockNumber);
       const gas = await provider.getFeeData();
       const a = gas["lastBaseFeePerGas"].toNumber()
       const b = gas["maxFeePerGas"].toNumber()
       const c = gas["maxPriorityFeePerGas"].toNumber()
       const d = gas["gasPrice"].toNumber()
-      console.log(a, b, c, d)
+      //console.log(a, b, c, d)
     }
     );
     */
+    
 }
 
 main()
