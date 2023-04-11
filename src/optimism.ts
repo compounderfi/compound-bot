@@ -1,8 +1,7 @@
 import * as dotenv from "dotenv";
-import { ethers, Contract, BigNumber } from "ethers";
-import {COMPOUNDER_CONTRACT_ADDRESS, NFPM_ADDRESS, COMPOUNDER_ABI} from "./test"
+import { ethers} from "ethers";
+import {COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, FEE} from "./constants"
 import {tokenToAuto} from '@thanpolas/crypto-utils';
-import { Alchemy, Network } from "alchemy-sdk";
 import axios from "axios";
 const optimismSDK = require("@eth-optimism/sdk")
 
@@ -105,6 +104,9 @@ class Call {
   shouldCompound: Boolean;
   gasThreshold: number;
 
+  profitToken0: number;
+  profitToken1: number;
+
   constructor(tokenID: number, price0: number, price1:number, token0Decimals: number, token1Decimals:number) {
     this.tokenID = tokenID;
     this.price0 = price0;
@@ -153,18 +155,18 @@ class Call {
       return false;
     }
 
-    this.gasEstimateToken0AsFee *= 1.25; //account for compounding risk, as well as changes in gas
-    this.gasEstimateToken1AsFee *= 1.25;
+    this.gasEstimateToken0AsFee *= FEE; //account for compounding risk, as well as changes in gas
+    this.gasEstimateToken1AsFee *= FEE;
     /*
     const estimatedCostToken0AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken0AsFee * this.gasPriceWei));
     const estimatedCostToken1AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken1AsFee * this.gasPriceWei));
     */
-    const profitToken0 = this.fee0InEth - this.gasEstimateToken0AsFee;
-    const profitToken1 = this.fee1InEth - this.gasEstimateToken1AsFee;
+    this.profitToken0 = this.fee0InEth - this.gasEstimateToken0AsFee;
+    this.profitToken1 = this.fee1InEth - this.gasEstimateToken1AsFee;
     
-    this.shouldTakeToken0 = profitToken0 > profitToken1;
+    this.shouldTakeToken0 = this.profitToken0 > this.profitToken1;
 
-    if (profitToken0 > 0 || profitToken1 > 0) {
+    if (this.profitToken0 > 0 || this.profitToken1 > 0) {
       this.shouldCompound = true;
     } else {
       this.shouldCompound = false;
@@ -203,9 +205,9 @@ class Call {
   async sendTXN() {
     try {
       console.log("sending txn for tokenID: " + this.tokenID)
-      //await contract.connect(signer).compound(this.tokenID, this.token, )
+      await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0)
     } catch(e) {
-      console.log(e);
+      console.log("failed to send txn for tokenID: " + this.tokenID);
       return false;
     }
     return true;
@@ -217,41 +219,31 @@ async function updatePositions() {
 
   const prices = await getPrices(uniqueTokens);
 
-  const tempCalls: Call[] = [];
   for(const position of positions) {
     const token0Price = prices[position.token0Address];
     const token1Price = prices[position.token1Address];
     const call = new Call(position.tokenId, token0Price, token1Price, position.token0Decimals, position.token1Decimals);
     if (await call.getFees() && await call.getCallableGas()) {
-      tempCalls.push(call)
+      console.log(call)
 
       if (call.shouldCompound) {
         await call.sendTXN();
         call.shouldCompound = false
       }
       
-      console.log(call)
       await new Promise(r => setTimeout(r, 3000)); //wait 3 seconds
     }
 
   }
-  return tempCalls;
 }
 
 async function main() {
 
-    let calls: Call[] = []
     setInterval(async () => {
-        calls = await updatePositions();
+      await updatePositions();
     }, 10 * 60 * 1000 //refresh positions every 10 minutes
     )
 
-    
-    setInterval(() => {
-      if (calls.length > 0)
-      console.log(calls)
-    })
-    
     await updatePositions();
     //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
 
