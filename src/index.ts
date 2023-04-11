@@ -1,23 +1,42 @@
 import * as dotenv from "dotenv";
-import { ethers} from "ethers";
-import {COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, FEE} from "./constants"
+import { BigNumber, ethers} from "ethers";
+import {COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, FEE, CHAINLINK_MATIC_ETH, CHAINLINK_ABI, GAS_LIMIT_BUFFER} from "./constants"
 import {tokenToAuto} from '@thanpolas/crypto-utils';
 import axios from "axios";
 const optimismSDK = require("@eth-optimism/sdk")
 
 dotenv.config();
 
-const l2RpcProvider = optimismSDK.asL2Provider(
-  new ethers.providers.JsonRpcProvider(process.env.RPC_OPTIMISM)
-)
+let provider: ethers.providers.JsonRpcProvider;
+let compounderGraphURL: string;
+let uniswapGraphUrl: string;
 
-const signer = new ethers.Wallet(process.env.PRIVATE_KEY, l2RpcProvider)
-const contract = new ethers.Contract(COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, l2RpcProvider)
-const standardDecimals = ethers.BigNumber.from(10).pow(18);
+if (process.argv[2] && process.argv[2] === '-o') {
+  provider = optimismSDK.asL2Provider(new ethers.providers.JsonRpcProvider(process.env.RPC_OPTIMISM))
+  compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-optimism";
+  uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-optimism";
+} else if (process.argv[2] && process.argv[2] === '-a') {
+  provider =  new ethers.providers.JsonRpcProvider(process.env.RPC_ARBITRUM)
+  compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-arbitrium";
+  uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-arbitrum";
+} else if (process.argv[2] && process.argv[2] === '-p') {
+  provider =  new ethers.providers.JsonRpcProvider(process.env.RPC_POLYGON)
+  compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-polygon";
+  uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-polygon";
+} else {
+  provider =  new ethers.providers.JsonRpcProvider(process.env.RPC_MAINNET)
+  compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-mainnet";
+  uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-mainnet";
+}
+
+
+
+const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
+const contract = new ethers.Contract(COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, provider)
+const chainlink = new ethers.Contract(CHAINLINK_MATIC_ETH, CHAINLINK_ABI, provider)
 
 async function getTokens() {
-    const graphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-optimism";
-    const resp = await axios.post(graphURL, {
+    const resp = await axios.post(compounderGraphURL, {
       query: `
       {
         positions(where: {tokenWithdraw: null}, first: 1000) {
@@ -59,8 +78,7 @@ async function getTokens() {
 
 
 async function getPrices(uniqueTokens) {
-    const graphURL = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-optimism";
-    const resp = await axios.post(graphURL, {
+    const resp = await axios.post(uniswapGraphUrl, {
         query: `
         {
             tokens(where: {id_in: ${JSON.stringify(uniqueTokens)}}) {
@@ -80,6 +98,30 @@ async function getPrices(uniqueTokens) {
     return tokenToPrice
 }
 
+async function getPolygonGas() {
+  // get max fees from gas station
+  let maxFeePerGas = ethers.BigNumber.from(100000000000) // fallback to 100 gwei
+  let maxPriorityFeePerGas = ethers.BigNumber.from(40000000000) // fallback to 40 gwei
+  try {
+      const { data } = await axios({
+          method: 'get',
+          url: 'https://gasstation-mainnet.matic.network/v2'
+      })
+      maxFeePerGas = ethers.utils.parseUnits(
+          Math.ceil(data.fast.maxFee) + '',
+          'gwei'
+      )
+      maxPriorityFeePerGas = ethers.utils.parseUnits(
+          Math.ceil(data.fast.maxPriorityFee) + '',
+          'gwei'
+      )
+  } catch {
+      // ignore
+  }
+  return [maxFeePerGas, maxPriorityFeePerGas]
+}
+
+
 class Call {
   tokenID: number;
   price0: number;
@@ -93,12 +135,11 @@ class Call {
   token0callerfees: String;
   token1callerfees: String;
 
-  maxGwei: number;
-
   gasEstimateToken0AsFee: number; //gas estimate in total - gas limit * gas price
   gasEstimateToken1AsFee: number;
-
-  gasPriceWei: number;
+  
+  gasLimitEstimate0asFee: number;
+  gasLimitEstimate1asFee: number;
 
   shouldTakeToken0: Boolean;
   shouldCompound: Boolean;
@@ -130,37 +171,63 @@ class Call {
     const fees1InDecimal = parseFloat(tokenToAuto(this.token1callerfees, this.token1Decimals, {decimalPlaces: this.token1Decimals}));
     this.fee1InEth = fees1InDecimal * this.price1;
     
-    /*
-    this.gasPriceWei = (await l2RpcProvider.getGasPrice()).toNumber();
-    */
+
     return true;
   }
 
+  
+  async estimateGas(tokenID: number, token0AsFee: boolean) {
+    const gasLimit = await contract.connect(signer).estimateGas.compound(tokenID, token0AsFee);
+    const gasPrice = await provider.getGasPrice();
+    const gasEstimate = gasLimit.mul(gasPrice);
+    
+    //if polygon
+    if (process.argv[2] && process.argv[2] === '-p') {
+      //we multiply MATIC/ETH price because fees are paid in MATIC
+      //gasEstimate in this case, is in MATIC
+      const maticEthPrice = await chainlink.latestAnswer();
+      const gasEstimateInEth = gasEstimate.mul(maticEthPrice)
+      return [parseFloat(tokenToAuto(gasEstimateInEth.toString(), 36, {decimalPlaces: 18})), gasLimit.toNumber()];
+      
+    }
+    
+    return [parseFloat(tokenToAuto(gasEstimate.toString(), 18, {decimalPlaces: 18})), gasLimit.toNumber()];
+  }
+
   async estimateGasOptimism(tokenID: number, token0AsFee: boolean) {
+    
     const txn = await contract.populateTransaction.compound(tokenID, token0AsFee)
     
     txn.gasPrice = ethers.BigNumber.from( 0 ); //optimism only: doesn't work when gasPrice is estimated for some reason
 
     const populatedTxn = await signer.populateTransaction(txn)
-    const gasEstimate = await l2RpcProvider.estimateTotalGasCost(populatedTxn)
+
+    //we ignore this because we assume that the provider we will use does have estimateTotalGasCost
+    //@ts-ignore
+    const gasEstimate = await provider.estimateTotalGasCost(populatedTxn)
 
     return parseFloat(tokenToAuto(gasEstimate.toString(), 18, {decimalPlaces: 18}));
   }
+
   async getCallableGas() {
     try {
-      this.gasEstimateToken0AsFee = await this.estimateGasOptimism(this.tokenID, true);
-      this.gasEstimateToken1AsFee = await this.estimateGasOptimism(this.tokenID, false);
+      if (process.argv[2] && process.argv[2] === '-o') {
+        this.gasEstimateToken0AsFee = await this.estimateGasOptimism(this.tokenID, true);
+        this.gasEstimateToken1AsFee = await this.estimateGasOptimism(this.tokenID, false);
+      } else {
+
+        [this.gasEstimateToken0AsFee, this.gasLimitEstimate0asFee] = await this.estimateGas(this.tokenID, true);
+        [this.gasEstimateToken1AsFee, this.gasLimitEstimate1asFee] = await this.estimateGas(this.tokenID, false);
+      }
     } catch(e) {
-      console.log(e);
+      //console.log(e);
+      console.log("cannot estimate gas")
       return false;
     }
 
     this.gasEstimateToken0AsFee *= FEE; //account for compounding risk, as well as changes in gas
     this.gasEstimateToken1AsFee *= FEE;
-    /*
-    const estimatedCostToken0AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken0AsFee * this.gasPriceWei));
-    const estimatedCostToken1AsFee = parseFloat(ethers.utils.formatEther(this.gasLimitToken1AsFee * this.gasPriceWei));
-    */
+
     this.profitToken0 = this.fee0InEth - this.gasEstimateToken0AsFee;
     this.profitToken1 = this.fee1InEth - this.gasEstimateToken1AsFee;
     
@@ -172,41 +239,37 @@ class Call {
       this.shouldCompound = false;
     }
     
-    /*
-    if (this.shouldTakeToken0) {
-      const gasLimitEstimate0 = this.gasLimitToken0AsFee * 1.1
-      this.gasThreshold = (this.fee0InEth / gasLimitEstimate0) * 10 ** 18;
-    } else {
-      const gasLimitEstimate1 = this.fee1InEth * 1.1
-      this.gasThreshold = (this.fee1InEth / gasLimitEstimate1) * 10 ** 18;
-    }*/
 
     return true;
   }
-/*
-  async ensureFees() {
-    let currentFee0: BigNumber;
-    let currentFee1: BigNumber;
-    try {
-      currentFee0 = (await contract.connect(signer).callStatic.compound(this.tokenID, true))["fee0"];
-      currentFee1 = (await contract.connect(signer).callStatic.compound(this.tokenID, false))["fee1"];
-    } catch(e) {
-      console.log(e);
-      return false;
-    }
 
-    const pastFee0 = BigNumber.from(this.token0callerfees);
-
-    const pastFee1 = BigNumber.from(this.token1callerfees);
-    console.log(currentFee0.gte(pastFee0), currentFee1.gte(pastFee1))
-    return currentFee0.gte(pastFee0) && currentFee1.gte(pastFee1);
-  }
-*/
   async sendTXN() {
     try {
       console.log("sending txn for tokenID: " + this.tokenID)
-      await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0)
+      //if not polygon
+      if (!(process.argv[2] && process.argv[2] === '-p')) {
+        await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0, {
+          gasLimit: this.shouldTakeToken0 ?
+            this.gasLimitEstimate0asFee + GAS_LIMIT_BUFFER :
+            this.gasLimitEstimate1asFee + GAS_LIMIT_BUFFER
+          })
+      } else {
+        //if polygon
+        let maxFeePerGas;
+        let maxPriorityFeePerGas;
+        [maxFeePerGas, maxPriorityFeePerGas] = await getPolygonGas();
+        await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0, {
+          maxFeePerGas: maxFeePerGas,
+          maxPriorityFeePerGas: maxPriorityFeePerGas,
+          gasLimit: this.shouldTakeToken0 ?
+            this.gasLimitEstimate0asFee + GAS_LIMIT_BUFFER :
+            this.gasLimitEstimate1asFee + GAS_LIMIT_BUFFER
+          
+        })
+      }
+
     } catch(e) {
+      //console.log(e)
       console.log("failed to send txn for tokenID: " + this.tokenID);
       return false;
     }
@@ -237,36 +300,15 @@ async function updatePositions() {
   }
 }
 
-async function main() {
 
+
+async function main() {
     setInterval(async () => {
       await updatePositions();
     }, 10 * 60 * 1000 //refresh positions every 10 minutes
     )
 
     await updatePositions();
-    //const poszero = new Call(position.tokenId, prices[position.token0Address], prices[position.token1Address], position.token0Decimals, position.token1Decimals);
-
-    /*
-    const settings = {
-        apiKey: process.env.ALCHEMY_API_KEY, // Replace with your Alchemy API Key.
-        network: Network.OPT_MAINNET, // Replace with your network.
-    };
-
-    const alchemy = new Alchemy(settings);
-
-    // Subscription for new blocks on Eth Mainnet.
-    alchemy.ws.on("block", async (blockNumber) => {
-      //console.log("The latest block number is", blockNumber);
-      const gas = await provider.getFeeData();
-      const a = gas["lastBaseFeePerGas"].toNumber()
-      const b = gas["maxFeePerGas"].toNumber()
-      const c = gas["maxPriorityFeePerGas"].toNumber()
-      const d = gas["gasPrice"].toNumber()
-      //console.log(a, b, c, d)
-    }
-    );
-    */
     
 }
 
