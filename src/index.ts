@@ -1,6 +1,6 @@
 import * as dotenv from "dotenv";
 import { BigNumber, ethers} from "ethers";
-import {COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, FEE, CHAINLINK_MATIC_ETH, CHAINLINK_ABI, GAS_LIMIT_BUFFER} from "./constants"
+import {COMPOUNDER_CONTRACT_ADDRESS, NFPM_ADDRESS, NFPM_ABI, COMPOUNDER_ABI, FEE, CHAINLINK_MATIC_ETH, CHAINLINK_ABI, GAS_LIMIT_BUFFER} from "./constants"
 import {tokenToAuto} from '@thanpolas/crypto-utils';
 import axios from "axios";
 const optimismSDK = require("@eth-optimism/sdk")
@@ -34,6 +34,7 @@ if (process.argv[2] && process.argv[2] === '-o') {
 const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider)
 const contract = new ethers.Contract(COMPOUNDER_CONTRACT_ADDRESS, COMPOUNDER_ABI, provider)
 const chainlink = new ethers.Contract(CHAINLINK_MATIC_ETH, CHAINLINK_ABI, provider)
+const NFPM = new ethers.Contract(NFPM_ADDRESS, NFPM_ABI, provider)
 
 async function getTokens() {
     const resp = await axios.post(compounderGraphURL, {
@@ -119,6 +120,14 @@ async function getPolygonGas() {
       // ignore
   }
   return [maxFeePerGas, maxPriorityFeePerGas]
+}
+
+async function hasLiquidity(tokenId: number) {
+  const positionDetails = await NFPM.positions(tokenId);
+  const liq = positionDetails.liquidity;
+
+  return liq.gt(0)
+  
 }
 
 
@@ -277,27 +286,36 @@ class Call {
   }
 }
 
+const noLiquidityPositions = <number[]>[]
+const hasLiquidityPositions = <number[]>[]
+
 async function updatePositions() {
   const [positions, uniqueTokens] = await getTokens();
 
   const prices = await getPrices(uniqueTokens);
-
   for(const position of positions) {
-    const token0Price = prices[position.token0Address];
-    const token1Price = prices[position.token1Address];
-    const call = new Call(position.tokenId, token0Price, token1Price, position.token0Decimals, position.token1Decimals);
-    if (await call.getFees() && await call.getCallableGas()) {
-      console.log(call)
+    if (!noLiquidityPositions.includes(position.tokenId) || hasLiquidityPositions.includes(position.tokenId)) {
+      if (await hasLiquidity(position.tokenId)) {
+        hasLiquidityPositions.push(position.tokenId);
 
-      if (call.shouldCompound) {
-        await call.sendTXN();
-        call.shouldCompound = false
+        const token0Price = prices[position.token0Address];
+        const token1Price = prices[position.token1Address];
+        const call = new Call(position.tokenId, token0Price, token1Price, position.token0Decimals, position.token1Decimals);
+        if (await call.getFees() && await call.getCallableGas()) {
+          console.log(call)
+          if (call.shouldCompound) {
+            await call.sendTXN();
+            call.shouldCompound = false
+          }
+          
+          await new Promise(r => setTimeout(r, 3000)); //wait 3 seconds
+        }
+      } else {
+        noLiquidityPositions.push(position.tokenId);
       }
-      
-      await new Promise(r => setTimeout(r, 3000)); //wait 3 seconds
-    }
 
   }
+}
 }
 
 
