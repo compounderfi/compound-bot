@@ -24,7 +24,7 @@ if (process.argv[2] && process.argv[2] === '-o') {
   compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-polygon";
   uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-polygon";
 } else {
-  provider =  new ethers.providers.JsonRpcProvider(process.env.RPC_MAINNET)
+  provider =  new ethers.providers.JsonRpcProvider(process.env.RPC_ETH)
   compounderGraphURL = "https://api.thegraph.com/subgraphs/name/compounderfi/compounderfi-mainnet";
   uniswapGraphUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-mainnet";
 }
