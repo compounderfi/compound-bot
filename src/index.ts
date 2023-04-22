@@ -257,11 +257,17 @@ class Call {
       console.log("sending txn for tokenID: " + this.tokenID)
       //if not polygon
       if (!(process.argv[2] && process.argv[2] === '-p')) {
-        await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0, {
-          gasLimit: this.shouldTakeToken0 ?
-            this.gasLimitEstimate0asFee + GAS_LIMIT_BUFFER :
-            this.gasLimitEstimate1asFee + GAS_LIMIT_BUFFER
-          })
+        //if not optimism
+        if (!(process.argv[2] && process.argv[2] === '-o')) {
+          await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0, {
+            gasLimit: this.shouldTakeToken0 ?
+              this.gasLimitEstimate0asFee + GAS_LIMIT_BUFFER :
+              this.gasLimitEstimate1asFee + GAS_LIMIT_BUFFER
+            })
+        } else {
+          //if optimism - don't need to worry about gas limit
+          await contract.connect(signer).compound(this.tokenID, this.shouldTakeToken0)
+        }
       } else {
         //if polygon
         let maxFeePerGas;
@@ -278,7 +284,7 @@ class Call {
       }
 
     } catch(e) {
-      //console.log(e)
+      console.log(e)
       console.log("failed to send txn for tokenID: " + this.tokenID);
       return false;
     }
